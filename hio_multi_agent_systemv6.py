@@ -20,8 +20,8 @@ import torch.nn.functional as F
 from transformers import (
     AutoProcessor, AutoModelForZeroShotObjectDetection,
     AutoModelForCausalLM, AutoTokenizer,
-    CLIPProcessor, CLIPModel,
-    BlipProcessor, BlipForConditionalGeneration
+    BlipProcessor, BlipForConditionalGeneration,
+    BlipForImageTextRetrieval
 )
 import re
 from scipy.optimize import linear_sum_assignment
@@ -562,23 +562,28 @@ class LLMRuleGenerator:
         
         # 尝试加载LLM
         self.use_llm = False
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         try:
-            model_name = "microsoft/phi-2"
+            model_name = "Qwen/Qwen2.5-0.5B-Instruct"
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True
             )
+            if not torch.cuda.is_available():
+                self.model.to(self.device)
+            self.model_name = model_name
             self.use_llm = True
             print(f"使用{model_name}生成规则")
         except Exception as e:
             print(f"LLM加载失败: {e}，使用预定义规则")
-        self.use_llm = False
+            self.model = None
+            self.tokenizer = None
         # 加载完整的预定义规则
         self.cached_rules = self._load_complete_rules()
     
@@ -594,54 +599,58 @@ class LLMRuleGenerator:
     
     def _generate_with_llm(self, verb: str, object_class: str) -> Dict:
         """使用LLM生成规则"""
-        prompt = f"""You are a HOI (Human-Object Interaction) expert. Analyze the interaction.
+        system_message = "You are a HOI (Human-Object Interaction) expert. Only reply with a single valid JSON object using double quotes."
+        user_message = (
+            f"Analyze whether a person can '{verb}' a '{object_class}'. "
+            "Return JSON with keys: plausibility (0-1 float), physical_possible (bool), common_sense (bool), "
+            "safe (bool), reasoning (string <= 60 chars)."
+        )
 
-Action: {verb}
-Object: {object_class}
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            prompt = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        else:
+            prompt = f"{system_message}\nUser: {user_message}\nAssistant:"
 
-Please respond in JSON format with these fields:
-- plausibility: score from 0 to 1
-- physical_possible: true or false
-- common_sense: true or false
-- safe: true or false
-- reasoning: brief explanation
-
-Example:
-{{"plausibility": 0.9, "physical_possible": true, "common_sense": true, "safe": true, "reasoning": "Common interaction"}}
-
-Now analyze: Can a person {verb} a {object_class}?
-Response:"""
-        
         try:
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-            if torch.cuda.is_available():
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-            
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=768
+            ).to(self.device)
+
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=150,
-                    temperature=0.1,
+                    max_new_tokens=200,
+                    temperature=0.2,
                     do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
                 )
-            
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            response = response.split("Response:")[-1].strip()
-            
+
+            gen_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+            response = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+
             # 尝试解析JSON
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group()
                 result = json.loads(json_str)
-                
+
                 return {
                     'plausibility': float(result.get('plausibility', 0.5)),
                     'is_valid': result.get('plausibility', 0.5) > 0.3,
-                    'physical_possible': result.get('physical_possible', True),
-                    'common_sense': result.get('common_sense', True),
-                    'safe': result.get('safe', True),
+                    'physical_possible': bool(result.get('physical_possible', True)),
+                    'common_sense': bool(result.get('common_sense', True)),
+                    'safe': bool(result.get('safe', True)),
                     'reasoning': result.get('reasoning', 'LLM analysis'),
                     'requirements': result.get('requirements', 'Standard'),
                     'source': 'llm'
@@ -866,20 +875,27 @@ class ProposalAgent:
         
         # 加载BLIP模型用于图像理解
         try:
-            self.blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            self.blip_model = BlipForConditionalGeneration.from_pretrained(
+            self.blip_caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.blip_caption_model = BlipForConditionalGeneration.from_pretrained(
                 "Salesforce/blip-image-captioning-base"
             ).to(device)
-            self.blip_model.eval()
-            self.use_blip = True
-        except:
-            print("BLIP模型加载失败")
-            self.use_blip = False
-        
-        # 加载CLIP模型用于零样本分类
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.clip_model.eval()
+            self.blip_caption_model.eval()
+            self.use_blip_caption = True
+        except Exception as e:
+            print(f"BLIP描述模型加载失败: {e}")
+            self.use_blip_caption = False
+
+        # 加载BLIP图文匹配模型用于动作筛选
+        try:
+            self.blip_itm_processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
+            self.blip_itm_model = BlipForImageTextRetrieval.from_pretrained(
+                "Salesforce/blip-itm-base-coco"
+            ).to(device)
+            self.blip_itm_model.eval()
+            self.use_blip_itm = True
+        except Exception as e:
+            print(f"BLIP-ITM模型加载失败: {e}")
+            self.use_blip_itm = False
     
     def propose(self, image_path: str, detections: Dict) -> List[HOIInstance]:
         """生成HOI提议"""
@@ -888,7 +904,7 @@ class ProposalAgent:
         
         # 使用BLIP生成场景描述
         scene_description = ""
-        if self.use_blip:
+        if self.use_blip_caption:
             scene_description = self._generate_scene_description(image)
         
         # 对每个人-物体对生成交互假设
@@ -900,9 +916,9 @@ class ProposalAgent:
                 # 计算空间关系
                 spatial_relation = self._compute_spatial_relation(human['bbox'], obj['bbox'])
                 
-                # 使用CLIP预测可能的交互
-                possible_verbs = self._predict_interactions_with_clip(
-                    image, human['bbox'], obj['bbox'], 
+                # 使用BLIP预测可能的交互
+                possible_verbs = self._predict_interactions_with_blip(
+                    image, human['bbox'], obj['bbox'],
                     obj.get('class', 'object')
                 )
                 
@@ -928,12 +944,12 @@ class ProposalAgent:
     def _generate_scene_description(self, image):
         """使用BLIP生成场景描述"""
         prompt = "a photo of"
-        inputs = self.blip_processor(image, prompt, return_tensors="pt").to(self.device)
-        
+        inputs = self.blip_caption_processor(image, prompt, return_tensors="pt").to(self.device)
+
         with torch.no_grad():
-            out = self.blip_model.generate(**inputs, max_length=50)
-        
-        description = self.blip_processor.decode(out[0], skip_special_tokens=True)
+            out = self.blip_caption_model.generate(**inputs, max_length=50)
+
+        description = self.blip_caption_processor.decode(out[0], skip_special_tokens=True)
         return description
     
     def _compute_spatial_relation(self, human_bbox, object_bbox):
@@ -967,8 +983,8 @@ class ProposalAgent:
             'vertical_relation': 'above' if h_cy < o_cy else 'below'
         }
     
-    def _predict_interactions_with_clip(self, image, human_bbox, object_bbox, object_class):
-        """使用CLIP预测可能的交互"""
+    def _predict_interactions_with_blip(self, image, human_bbox, object_bbox, object_class):
+        """使用BLIP图文匹配模型预测可能的交互"""
         # 裁剪交互区域
         x1 = int(max(0, min(human_bbox[0], object_bbox[0])))
         y1 = int(max(0, min(human_bbox[1], object_bbox[1])))
@@ -984,64 +1000,82 @@ class ProposalAgent:
         # 选择相关动词
         relevant_verbs = self._select_relevant_verbs(object_class)
         
+        if not self.use_blip_itm:
+            return [('hold', 0.3), ('look_at', 0.2)]
+
         # 构建文本提示
-        text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:15]]
-        
-        # CLIP推理
+        text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:20]]
+
+        # BLIP-ITM推理
         try:
             with torch.no_grad():
-                inputs = self.clip_processor(
+                inputs = self.blip_itm_processor(
                     text=text_prompts,
                     images=interaction_region,
                     return_tensors="pt",
-                    padding=True,
-                    truncation=True
+                    padding=True
                 ).to(self.device)
-                
-                outputs = self.clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1).cpu().numpy()[0]
-            
+
+                outputs = self.blip_itm_model(**inputs)
+                scores = outputs.itm_score[:, 1]
+                probs = torch.softmax(scores, dim=0).cpu().numpy()
+
             # 返回top-k动词
-            top_k = 5
+            top_k = min(5, len(relevant_verbs))
             top_indices = np.argsort(probs)[-top_k:][::-1]
-            results = [(relevant_verbs[i], float(probs[i])) 
-                      for i in top_indices if i < len(relevant_verbs)]
-            
+            results = [(relevant_verbs[i], float(probs[i])) for i in top_indices]
+
             return results
-            
+
         except Exception as e:
-            print(f"CLIP推理错误: {e}")
+            print(f"BLIP推理错误: {e}")
             return [('hold', 0.3), ('no_interaction', 0.2)]
     
     def _select_relevant_verbs(self, object_class):
         """根据物体类型选择相关动词"""
         # 基于物体类型选择可能的动词
         verb_groups = {
-            'vehicle': ['ride', 'drive', 'board', 'exit', 'push', 'wash', 'park', 'repair'],
-            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make'],
+            'vehicle': ['ride', 'drive', 'board', 'exit', 'push', 'wash', 'park', 'repair', 'load'],
+            'personal_item': ['carry', 'hold', 'pack', 'wear', 'inspect', 'open'],
+            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make', 'slice', 'buy'],
+            'kitchenware': ['wash', 'hold', 'fill', 'pour', 'dry', 'clean'],
             'furniture': ['sit_on', 'lie_on', 'stand_on', 'move', 'clean', 'push'],
             'electronic': ['use', 'type_on', 'watch', 'control', 'operate', 'check'],
+            'appliance': ['open', 'close', 'clean', 'repair', 'install', 'use'],
+            'bathroom': ['clean', 'flush', 'wash', 'repair', 'inspect'],
             'animal': ['pet', 'feed', 'ride', 'hug', 'walk', 'train', 'groom'],
-            'sports': ['throw', 'catch', 'kick', 'hit', 'play', 'hold', 'swing'],
-            'tool': ['use', 'hold', 'cut_with', 'repair', 'wield', 'work_with']
+            'plant': ['water', 'trim', 'inspect', 'move'],
+            'sports': ['throw', 'catch', 'kick', 'hit', 'play', 'hold', 'swing', 'balance'],
+            'tool': ['use', 'hold', 'cut_with', 'repair', 'wield', 'work_with'],
+            'structure': ['paint', 'clean', 'inspect', 'repair', 'lean_on'],
+            'toy': ['hug', 'hold', 'carry', 'play'],
+            'human': ['hug', 'help', 'guide', 'push', 'pull', 'follow', 'talk_on'],
+            'container': ['hold', 'move', 'clean', 'fill'],
+            'accessory': ['wear', 'hold', 'close', 'open']
         }
-        
-        # 物体类别映射
+
+        # 物体类别映射（覆盖80个COCO物体）
         category_map = {
-            'bicycle': 'vehicle', 'motorcycle': 'vehicle', 'car': 'vehicle',
-            'bus': 'vehicle', 'train': 'vehicle', 'truck': 'vehicle', 'airplane': 'vehicle',
-            'apple': 'food', 'banana': 'food', 'pizza': 'food', 'sandwich': 'food',
-            'cake': 'food', 'donut': 'food', 'hot_dog': 'food',
-            'chair': 'furniture', 'couch': 'furniture', 'bed': 'furniture',
-            'dining_table': 'furniture', 'bench': 'furniture', 'toilet': 'furniture',
-            'tv': 'electronic', 'laptop': 'electronic', 'cell_phone': 'electronic',
-            'keyboard': 'electronic', 'remote': 'electronic', 'mouse': 'electronic',
-            'dog': 'animal', 'cat': 'animal', 'horse': 'animal', 'cow': 'animal',
-            'sheep': 'animal', 'bird': 'animal', 'elephant': 'animal',
-            'sports_ball': 'sports', 'frisbee': 'sports', 'tennis_racket': 'sports',
-            'baseball_bat': 'sports', 'skateboard': 'sports', 'surfboard': 'sports',
-            'knife': 'tool', 'scissors': 'tool', 'fork': 'tool', 'spoon': 'tool'
+            'airplane': 'vehicle', 'apple': 'food', 'backpack': 'personal_item', 'banana': 'food',
+            'baseball_bat': 'sports', 'baseball_glove': 'sports', 'bear': 'animal', 'bed': 'furniture',
+            'bench': 'furniture', 'bicycle': 'vehicle', 'bird': 'animal', 'boat': 'vehicle',
+            'book': 'personal_item', 'bottle': 'kitchenware', 'bowl': 'kitchenware', 'broccoli': 'food',
+            'bus': 'vehicle', 'cake': 'food', 'car': 'vehicle', 'carrot': 'food',
+            'cat': 'animal', 'cell_phone': 'electronic', 'chair': 'furniture', 'clock': 'structure',
+            'couch': 'furniture', 'cow': 'animal', 'cup': 'kitchenware', 'dining_table': 'furniture',
+            'dog': 'animal', 'donut': 'food', 'elephant': 'animal', 'fire_hydrant': 'structure',
+            'fork': 'kitchenware', 'frisbee': 'sports', 'giraffe': 'animal', 'hair_drier': 'appliance',
+            'handbag': 'personal_item', 'horse': 'animal', 'hot_dog': 'food', 'keyboard': 'electronic',
+            'kite': 'sports', 'knife': 'tool', 'laptop': 'electronic', 'microwave': 'appliance',
+            'motorcycle': 'vehicle', 'mouse': 'electronic', 'orange': 'food', 'oven': 'appliance',
+            'parking_meter': 'structure', 'person': 'human', 'pizza': 'food', 'potted_plant': 'plant',
+            'refrigerator': 'appliance', 'remote': 'electronic', 'sandwich': 'food', 'scissors': 'tool',
+            'sheep': 'animal', 'sink': 'bathroom', 'skateboard': 'sports', 'skis': 'sports',
+            'snowboard': 'sports', 'spoon': 'kitchenware', 'sports_ball': 'sports', 'stop_sign': 'structure',
+            'suitcase': 'personal_item', 'surfboard': 'sports', 'teddy_bear': 'toy', 'tennis_racket': 'sports',
+            'tie': 'accessory', 'toaster': 'appliance', 'toilet': 'bathroom', 'toothbrush': 'bathroom',
+            'traffic_light': 'structure', 'train': 'vehicle', 'truck': 'vehicle', 'tv': 'electronic',
+            'umbrella': 'accessory', 'vase': 'container', 'wine_glass': 'kitchenware', 'zebra': 'animal'
         }
         
         # 获取相关动词
