@@ -34,6 +34,12 @@ import warnings
 import os
 warnings.filterwarnings('ignore')
 
+# 离线缓存文件路径
+OFFLINE_RULE_CACHE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    'offline_llm_rule_cache.json'
+)
+
 # ==================== 全局常量定义 ====================
 
 # 完整的117个动作列表
@@ -559,7 +565,7 @@ class LLMRuleGenerator:
     
     def __init__(self):
         print("初始化LLM规则生成器...")
-        
+
         # 尝试加载LLM
         self.use_llm = False
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -586,9 +592,17 @@ class LLMRuleGenerator:
             self.tokenizer = None
         # 加载完整的预定义规则
         self.cached_rules = self._load_complete_rules()
-    
+        self.offline_cache_path = OFFLINE_RULE_CACHE_PATH
+        self.offline_rules = self._load_offline_rules()
+        if self.offline_rules:
+            print(f"已加载离线LLM规则缓存: {self.offline_cache_path}")
+
     def generate_interaction_rules(self, verb: str, object_class: str) -> Dict:
         """生成特定动作和物体的交互规则"""
+        offline_rule = self._get_offline_rule(verb, object_class)
+        if offline_rule:
+            return offline_rule
+
         if self.use_llm:
             try:
                 return self._generate_with_llm(verb, object_class)
@@ -685,7 +699,24 @@ class LLMRuleGenerator:
             'requirements': 'Standard conditions',
             'source': 'llm_fallback'
         }
-    
+
+    def _get_offline_rule(self, verb: str, object_class: str) -> Optional[Dict]:
+        """从离线缓存中读取规则"""
+        if not self.offline_rules:
+            return None
+
+        verb_rules = self.offline_rules.get(verb)
+        if not verb_rules:
+            return None
+
+        rule = verb_rules.get(object_class)
+        if not rule:
+            return None
+
+        rule = dict(rule)
+        rule.setdefault('source', 'offline_cache')
+        return rule
+
     def _use_cached_rules(self, verb: str, object_class: str) -> Dict:
         """使用预定义的缓存规则"""
         if verb in self.cached_rules and object_class in self.cached_rules[verb]:
@@ -702,6 +733,19 @@ class LLMRuleGenerator:
             'requirements': 'General conditions',
             'source': 'default'
         }
+
+    def _load_offline_rules(self) -> Optional[Dict]:
+        """加载离线缓存文件"""
+        if not self.offline_cache_path or not os.path.exists(self.offline_cache_path):
+            return None
+
+        try:
+            with open(self.offline_cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data
+        except Exception as e:
+            print(f"读取离线缓存失败: {e}")
+            return None
     
     def _load_complete_rules(self) -> Dict:
         """加载所有117个动作的完整规则"""
