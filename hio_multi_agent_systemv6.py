@@ -154,7 +154,7 @@ def get_action_categories():
         # 骑乘类
         'ride', 'drive', 'row', 'sail',
         # 抓握类
-        'catch', 'grab',
+        'catch',
         # 其他接触类
         'milk', 'shear', 'feed', 'toast', 'serve', 'set', 'paint',
         'cut', 'grind', 'flip', 'make', 'load', 'stick'
@@ -169,23 +169,23 @@ def get_action_categories():
         # 指向类
         'point', 'direct',
         # 观察类
-        'watch', 'inspect', 'check', 'read', 'look_at',
+        'watch', 'inspect', 'check', 'read',
         # 追逐类
         'chase', 'hunt',
         # 释放类
         'release', 'fly',
         # 远程交互
-        'talk_on', 'shoot'
+        'talk_on'
     ]
     
     # 可近可远的动作
     flexible_distance = [
         # 感知类
-        'smell', 'listen',
+        'smell',
         # 运动类
         'run', 'walk', 'jump', 'slide', 'race',
         # 玩耍类
-        'play', 'dribble', 'spin',
+        'dribble', 'spin',
         # 教学类
         'teach', 'train',
         # 阻挡类
@@ -235,7 +235,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
     score = 0.8
     
     # ========== 手部操作类动作 ==========
-    if verb in ['hold', 'carry', 'pick_up', 'lift', 'grasp', 'grab', 'wield']:
+    if verb in ['hold', 'carry', 'pick_up', 'pick', 'lift', 'wield']:
         hand_reach = h_height * 0.6
         if distance > hand_reach:
             score *= 0.3
@@ -245,7 +245,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.5
             
     # ========== 脚部动作 ==========
-    elif verb in ['kick', 'step_on']:
+    elif verb in ['kick']:
         foot_level = h_cy + h_height * 0.4
         if abs(o_cy - foot_level) > h_height * 0.2:
             score *= 0.4
@@ -338,7 +338,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.3
             
     # ========== 清洁类动作 ==========
-    elif verb in ['clean', 'wash', 'dry', 'wipe']:
+    elif verb in ['clean', 'wash', 'dry']:
         if distance > h_height * 0.6:
             score *= 0.3
             
@@ -352,7 +352,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.5
             
     # ========== 操作类动作 ==========
-    elif verb in ['open', 'close', 'turn', 'adjust', 'operate', 'control']:
+    elif verb in ['open', 'turn', 'adjust', 'operate', 'control']:
         if distance > h_height * 0.5:
             score *= 0.3
             
@@ -374,7 +374,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.7
             
     # ========== 观察类动作 ==========
-    elif verb in ['watch', 'look_at', 'inspect', 'check', 'read']:
+    elif verb in ['watch', 'inspect', 'check', 'read']:
         if distance < h_height * 0.1:
             score *= 0.5
         if distance > h_height * 3:
@@ -1045,7 +1045,7 @@ class ProposalAgent:
         relevant_verbs = self._select_relevant_verbs(object_class)
         
         if not self.use_blip_itm:
-            return [('hold', 0.3), ('look_at', 0.2)]
+            return [('hold', 0.3), ('watch', 0.2)]
 
         # 构建文本提示
         text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:20]]
@@ -1081,21 +1081,21 @@ class ProposalAgent:
         verb_groups = {
             'vehicle': ['ride', 'drive', 'board', 'exit', 'push', 'wash', 'park', 'repair', 'load'],
             'personal_item': ['carry', 'hold', 'pack', 'wear', 'inspect', 'open'],
-            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make', 'slice', 'buy'],
+            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make', 'cut_with', 'buy'],
             'kitchenware': ['wash', 'hold', 'fill', 'pour', 'dry', 'clean'],
             'furniture': ['sit_on', 'lie_on', 'stand_on', 'move', 'clean', 'push'],
-            'electronic': ['use', 'type_on', 'watch', 'control', 'operate', 'check'],
-            'appliance': ['open', 'close', 'clean', 'repair', 'install', 'use'],
+            'electronic': ['operate', 'control', 'type_on', 'text_on', 'watch', 'check'],
+            'appliance': ['open', 'operate', 'clean', 'repair', 'install', 'wash'],
             'bathroom': ['clean', 'flush', 'wash', 'repair', 'inspect'],
             'animal': ['pet', 'feed', 'ride', 'hug', 'walk', 'train', 'groom'],
-            'plant': ['water', 'trim', 'inspect', 'move'],
-            'sports': ['throw', 'catch', 'kick', 'hit', 'play', 'hold', 'swing', 'balance'],
-            'tool': ['use', 'hold', 'cut_with', 'repair', 'wield', 'work_with'],
-            'structure': ['paint', 'clean', 'inspect', 'repair', 'lean_on'],
-            'toy': ['hug', 'hold', 'carry', 'play'],
-            'human': ['hug', 'help', 'guide', 'push', 'pull', 'follow', 'talk_on'],
+            'plant': ['pick', 'cut', 'inspect', 'move'],
+            'sports': ['throw', 'catch', 'kick', 'hit', 'hold', 'swing', 'dribble', 'race'],
+            'tool': ['hold', 'cut_with', 'repair', 'wield', 'assemble', 'make'],
+            'structure': ['paint', 'clean', 'inspect', 'repair', 'stand_on'],
+            'toy': ['hug', 'hold', 'carry', 'pet'],
+            'human': ['hug', 'push', 'pull', 'talk_on', 'teach', 'train', 'watch'],
             'container': ['hold', 'move', 'clean', 'fill'],
-            'accessory': ['wear', 'hold', 'close', 'open']
+            'accessory': ['wear', 'hold', 'open', 'pack', 'zip']
         }
 
         # 物体类别映射（覆盖80个COCO物体）
@@ -1130,7 +1130,7 @@ class ProposalAgent:
             specific_verbs = []
         
         # 添加通用动词
-        general_verbs = ['hold', 'carry', 'look_at', 'point', 'touch', 'inspect', 'move']
+        general_verbs = ['hold', 'carry', 'point', 'inspect', 'move', 'watch']
         
         # 合并并去重
         all_verbs = list(set(specific_verbs + general_verbs))
