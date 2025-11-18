@@ -1061,8 +1061,15 @@ class ProposalAgent:
                 ).to(self.device)
 
                 outputs = self.blip_itm_model(**inputs)
-                scores = outputs.itm_score[:, 1]
-                probs = torch.softmax(scores, dim=0).cpu().numpy()
+                logits = outputs.itm_score
+                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+            # 判断是否存在交互
+            interaction_threshold = 0.35
+            max_prob = float(probs.max()) if len(probs) > 0 else 0.0
+
+            if max_prob < interaction_threshold:
+                return [('no_interaction', max_prob)]
 
             # 返回top-k动词
             top_k = min(5, len(relevant_verbs))
