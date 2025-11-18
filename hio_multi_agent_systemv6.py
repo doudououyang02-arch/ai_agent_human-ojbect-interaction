@@ -21,7 +21,7 @@ from transformers import (
     AutoProcessor, AutoModelForZeroShotObjectDetection,
     AutoModelForCausalLM, AutoTokenizer,
     BlipProcessor, BlipForConditionalGeneration,
-    BlipForImageTextRetrieval
+    CLIPProcessor, CLIPModel
 )
 import re
 from scipy.optimize import linear_sum_assignment
@@ -929,17 +929,17 @@ class ProposalAgent:
             print(f"BLIP描述模型加载失败: {e}")
             self.use_blip_caption = False
 
-        # 加载BLIP图文匹配模型用于动作筛选
+        # 加载CLIP模型用于图文相似度计算
         try:
-            self.blip_itm_processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
-            self.blip_itm_model = BlipForImageTextRetrieval.from_pretrained(
-                "Salesforce/blip-itm-base-coco"
+            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            self.clip_model = CLIPModel.from_pretrained(
+                "openai/clip-vit-base-patch32"
             ).to(device)
-            self.blip_itm_model.eval()
-            self.use_blip_itm = True
+            self.clip_model.eval()
+            self.use_clip_similarity = True
         except Exception as e:
-            print(f"BLIP-ITM模型加载失败: {e}")
-            self.use_blip_itm = False
+            print(f"CLIP模型加载失败: {e}")
+            self.use_clip_similarity = False
     
     def propose(self, image_path: str, detections: Dict) -> List[HOIInstance]:
         """生成HOI提议"""
@@ -960,8 +960,8 @@ class ProposalAgent:
                 # 计算空间关系
                 spatial_relation = self._compute_spatial_relation(human['bbox'], obj['bbox'])
                 
-                # 使用BLIP预测可能的交互
-                possible_verbs = self._predict_interactions_with_blip(
+                # 使用图文相似度模型预测可能的交互
+                possible_verbs = self._predict_interactions_with_clip(
                     image, human['bbox'], obj['bbox'],
                     obj.get('class', 'object')
                 )
@@ -1027,8 +1027,8 @@ class ProposalAgent:
             'vertical_relation': 'above' if h_cy < o_cy else 'below'
         }
     
-    def _predict_interactions_with_blip(self, image, human_bbox, object_bbox, object_class):
-        """使用BLIP图文匹配模型预测可能的交互"""
+    def _predict_interactions_with_clip(self, image, human_bbox, object_bbox, object_class):
+        """使用CLIP图文相似度预测可能的交互"""
         # 裁剪交互区域
         x1 = int(max(0, min(human_bbox[0], object_bbox[0])))
         y1 = int(max(0, min(human_bbox[1], object_bbox[1])))
@@ -1044,48 +1044,31 @@ class ProposalAgent:
         # 选择相关动词
         relevant_verbs = self._select_relevant_verbs(object_class)
         
-        if not self.use_blip_itm:
+        if not self.use_clip_similarity:
             return [('hold', 0.3), ('watch', 0.2)]
 
         # 构建文本提示
         text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:20]]
 
-        # BLIP-ITM推理
+        # CLIP图文相似度
         try:
             with torch.no_grad():
-                inputs = self.blip_itm_processor(
-                    text=text_prompts,
+                image_inputs = self.clip_processor(
                     images=interaction_region,
+                    return_tensors="pt"
+                ).to(self.device)
+                text_inputs = self.clip_processor(
+                    text=text_prompts,
                     return_tensors="pt",
                     padding=True
                 ).to(self.device)
 
-                outputs = self.blip_itm_model(**inputs)
+                image_features = self.clip_model.get_image_features(**image_inputs)
+                text_features = self.clip_model.get_text_features(**text_inputs)
 
-                # 提取图像和文本特征，计算余弦相似度
-                image_embeds = getattr(outputs, 'image_embeds_proj', None)
-                text_embeds = getattr(outputs, 'text_embeds_proj', None)
-
-                if image_embeds is None or text_embeds is None:
-                    image_embeds = getattr(outputs, 'image_embeds', None)
-                    text_embeds = getattr(outputs, 'text_embeds', None)
-
-                if image_embeds is None or text_embeds is None:
-                    raise RuntimeError('BLIP输出缺少图像/文本特征，无法计算相似度')
-
-                if image_embeds.dim() == 3:
-                    image_embeds = image_embeds[:, 0, :]
-                if text_embeds.dim() == 3:
-                    text_embeds = text_embeds[:, 0, :]
-
-                if image_embeds.shape[0] == 1 and text_embeds.shape[0] > 1:
-                    image_embeds = image_embeds.repeat(text_embeds.shape[0], 1)
-                elif text_embeds.shape[0] == 1 and image_embeds.shape[0] > 1:
-                    text_embeds = text_embeds.repeat(image_embeds.shape[0], 1)
-
-                image_embeds = F.normalize(image_embeds, dim=-1)
-                text_embeds = F.normalize(text_embeds, dim=-1)
-                cosine_sim = torch.sum(image_embeds * text_embeds, dim=-1)
+                image_features = F.normalize(image_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+                cosine_sim = torch.matmul(text_features, image_features.T).squeeze(-1)
                 similarities = torch.clamp((cosine_sim + 1.0) / 2.0, 0.0, 1.0).cpu().numpy()
 
             # 判断是否存在交互
@@ -1103,7 +1086,7 @@ class ProposalAgent:
             return results
 
         except Exception as e:
-            print(f"BLIP推理错误: {e}")
+            print(f"CLIP相似度计算错误: {e}")
             return [('hold', 0.3), ('no_interaction', 0.2)]
     
     def _select_relevant_verbs(self, object_class):
