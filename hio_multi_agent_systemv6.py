@@ -1061,20 +1061,44 @@ class ProposalAgent:
                 ).to(self.device)
 
                 outputs = self.blip_itm_model(**inputs)
-                logits = outputs.itm_score
-                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+                # 提取图像和文本特征，计算余弦相似度
+                image_embeds = getattr(outputs, 'image_embeds_proj', None)
+                text_embeds = getattr(outputs, 'text_embeds_proj', None)
+
+                if image_embeds is None or text_embeds is None:
+                    image_embeds = getattr(outputs, 'image_embeds', None)
+                    text_embeds = getattr(outputs, 'text_embeds', None)
+
+                if image_embeds is None or text_embeds is None:
+                    raise RuntimeError('BLIP输出缺少图像/文本特征，无法计算相似度')
+
+                if image_embeds.dim() == 3:
+                    image_embeds = image_embeds[:, 0, :]
+                if text_embeds.dim() == 3:
+                    text_embeds = text_embeds[:, 0, :]
+
+                if image_embeds.shape[0] == 1 and text_embeds.shape[0] > 1:
+                    image_embeds = image_embeds.repeat(text_embeds.shape[0], 1)
+                elif text_embeds.shape[0] == 1 and image_embeds.shape[0] > 1:
+                    text_embeds = text_embeds.repeat(image_embeds.shape[0], 1)
+
+                image_embeds = F.normalize(image_embeds, dim=-1)
+                text_embeds = F.normalize(text_embeds, dim=-1)
+                cosine_sim = torch.sum(image_embeds * text_embeds, dim=-1)
+                similarities = torch.clamp((cosine_sim + 1.0) / 2.0, 0.0, 1.0).cpu().numpy()
 
             # 判断是否存在交互
-            interaction_threshold = 0.35
-            max_prob = float(probs.max()) if len(probs) > 0 else 0.0
+            interaction_threshold = 0.5
+            max_similarity = float(similarities.max()) if len(similarities) > 0 else 0.0
 
-            if max_prob < interaction_threshold:
-                return [('no_interaction', max_prob)]
+            if max_similarity < interaction_threshold:
+                return [('no_interaction', max_similarity)]
 
             # 返回top-k动词
             top_k = min(5, len(relevant_verbs))
-            top_indices = np.argsort(probs)[-top_k:][::-1]
-            results = [(relevant_verbs[i], float(probs[i])) for i in top_indices]
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            results = [(relevant_verbs[i], float(similarities[i])) for i in top_indices]
 
             return results
 
