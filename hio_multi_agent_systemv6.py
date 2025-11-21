@@ -20,8 +20,8 @@ import torch.nn.functional as F
 from transformers import (
     AutoProcessor, AutoModelForZeroShotObjectDetection,
     AutoModelForCausalLM, AutoTokenizer,
-    CLIPProcessor, CLIPModel,
-    BlipProcessor, BlipForConditionalGeneration
+    BlipProcessor, BlipForConditionalGeneration,
+    CLIPProcessor, CLIPModel
 )
 import re
 from scipy.optimize import linear_sum_assignment
@@ -33,6 +33,12 @@ except:
 import warnings
 import os
 warnings.filterwarnings('ignore')
+
+# 离线缓存文件路径
+OFFLINE_RULE_CACHE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    'offline_llm_rule_cache.json'
+)
 
 # ==================== 全局常量定义 ====================
 
@@ -148,7 +154,7 @@ def get_action_categories():
         # 骑乘类
         'ride', 'drive', 'row', 'sail',
         # 抓握类
-        'catch', 'grab',
+        'catch',
         # 其他接触类
         'milk', 'shear', 'feed', 'toast', 'serve', 'set', 'paint',
         'cut', 'grind', 'flip', 'make', 'load', 'stick'
@@ -163,23 +169,23 @@ def get_action_categories():
         # 指向类
         'point', 'direct',
         # 观察类
-        'watch', 'inspect', 'check', 'read', 'look_at',
+        'watch', 'inspect', 'check', 'read',
         # 追逐类
         'chase', 'hunt',
         # 释放类
         'release', 'fly',
         # 远程交互
-        'talk_on', 'shoot'
+        'talk_on'
     ]
     
     # 可近可远的动作
     flexible_distance = [
         # 感知类
-        'smell', 'listen',
+        'smell',
         # 运动类
         'run', 'walk', 'jump', 'slide', 'race',
         # 玩耍类
-        'play', 'dribble', 'spin',
+        'dribble', 'spin',
         # 教学类
         'teach', 'train',
         # 阻挡类
@@ -229,7 +235,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
     score = 0.8
     
     # ========== 手部操作类动作 ==========
-    if verb in ['hold', 'carry', 'pick_up', 'lift', 'grasp', 'grab', 'wield']:
+    if verb in ['hold', 'carry', 'pick_up', 'pick', 'lift', 'wield']:
         hand_reach = h_height * 0.6
         if distance > hand_reach:
             score *= 0.3
@@ -239,7 +245,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.5
             
     # ========== 脚部动作 ==========
-    elif verb in ['kick', 'step_on']:
+    elif verb in ['kick']:
         foot_level = h_cy + h_height * 0.4
         if abs(o_cy - foot_level) > h_height * 0.2:
             score *= 0.4
@@ -332,7 +338,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.3
             
     # ========== 清洁类动作 ==========
-    elif verb in ['clean', 'wash', 'dry', 'wipe']:
+    elif verb in ['clean', 'wash', 'dry']:
         if distance > h_height * 0.6:
             score *= 0.3
             
@@ -346,7 +352,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.5
             
     # ========== 操作类动作 ==========
-    elif verb in ['open', 'close', 'turn', 'adjust', 'operate', 'control']:
+    elif verb in ['open', 'turn', 'adjust', 'operate', 'control']:
         if distance > h_height * 0.5:
             score *= 0.3
             
@@ -368,7 +374,7 @@ def analyze_physics_constraints_complete(proposal, image_shape=None):
             score *= 0.7
             
     # ========== 观察类动作 ==========
-    elif verb in ['watch', 'look_at', 'inspect', 'check', 'read']:
+    elif verb in ['watch', 'inspect', 'check', 'read']:
         if distance < h_height * 0.1:
             score *= 0.5
         if distance > h_height * 3:
@@ -559,31 +565,44 @@ class LLMRuleGenerator:
     
     def __init__(self):
         print("初始化LLM规则生成器...")
-        
+
         # 尝试加载LLM
         self.use_llm = False
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         try:
-            model_name = "microsoft/phi-2"
+            model_name = "Qwen/Qwen2.5-0.5B-Instruct"
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True
             )
+            if not torch.cuda.is_available():
+                self.model.to(self.device)
+            self.model_name = model_name
             self.use_llm = True
             print(f"使用{model_name}生成规则")
         except Exception as e:
             print(f"LLM加载失败: {e}，使用预定义规则")
-        self.use_llm = False
+            self.model = None
+            self.tokenizer = None
         # 加载完整的预定义规则
         self.cached_rules = self._load_complete_rules()
-    
+        self.offline_cache_path = OFFLINE_RULE_CACHE_PATH
+        self.offline_rules = self._load_offline_rules()
+        if self.offline_rules:
+            print(f"已加载离线LLM规则缓存: {self.offline_cache_path}")
+
     def generate_interaction_rules(self, verb: str, object_class: str) -> Dict:
         """生成特定动作和物体的交互规则"""
+        offline_rule = self._get_offline_rule(verb, object_class)
+        if offline_rule:
+            return offline_rule
+
         if self.use_llm:
             try:
                 return self._generate_with_llm(verb, object_class)
@@ -594,54 +613,58 @@ class LLMRuleGenerator:
     
     def _generate_with_llm(self, verb: str, object_class: str) -> Dict:
         """使用LLM生成规则"""
-        prompt = f"""You are a HOI (Human-Object Interaction) expert. Analyze the interaction.
+        system_message = "You are a HOI (Human-Object Interaction) expert. Only reply with a single valid JSON object using double quotes."
+        user_message = (
+            f"Analyze whether a person can '{verb}' a '{object_class}'. "
+            "Return JSON with keys: plausibility (0-1 float), physical_possible (bool), common_sense (bool), "
+            "safe (bool), reasoning (string <= 60 chars)."
+        )
 
-Action: {verb}
-Object: {object_class}
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            prompt = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        else:
+            prompt = f"{system_message}\nUser: {user_message}\nAssistant:"
 
-Please respond in JSON format with these fields:
-- plausibility: score from 0 to 1
-- physical_possible: true or false
-- common_sense: true or false
-- safe: true or false
-- reasoning: brief explanation
-
-Example:
-{{"plausibility": 0.9, "physical_possible": true, "common_sense": true, "safe": true, "reasoning": "Common interaction"}}
-
-Now analyze: Can a person {verb} a {object_class}?
-Response:"""
-        
         try:
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-            if torch.cuda.is_available():
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-            
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=768
+            ).to(self.device)
+
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=150,
-                    temperature=0.1,
+                    max_new_tokens=200,
+                    temperature=0.2,
                     do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
                 )
-            
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            response = response.split("Response:")[-1].strip()
-            
+
+            gen_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+            response = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+
             # 尝试解析JSON
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group()
                 result = json.loads(json_str)
-                
+
                 return {
                     'plausibility': float(result.get('plausibility', 0.5)),
                     'is_valid': result.get('plausibility', 0.5) > 0.3,
-                    'physical_possible': result.get('physical_possible', True),
-                    'common_sense': result.get('common_sense', True),
-                    'safe': result.get('safe', True),
+                    'physical_possible': bool(result.get('physical_possible', True)),
+                    'common_sense': bool(result.get('common_sense', True)),
+                    'safe': bool(result.get('safe', True)),
                     'reasoning': result.get('reasoning', 'LLM analysis'),
                     'requirements': result.get('requirements', 'Standard'),
                     'source': 'llm'
@@ -676,7 +699,24 @@ Response:"""
             'requirements': 'Standard conditions',
             'source': 'llm_fallback'
         }
-    
+
+    def _get_offline_rule(self, verb: str, object_class: str) -> Optional[Dict]:
+        """从离线缓存中读取规则"""
+        if not self.offline_rules:
+            return None
+
+        verb_rules = self.offline_rules.get(verb)
+        if not verb_rules:
+            return None
+
+        rule = verb_rules.get(object_class)
+        if not rule:
+            return None
+
+        rule = dict(rule)
+        rule.setdefault('source', 'offline_cache')
+        return rule
+
     def _use_cached_rules(self, verb: str, object_class: str) -> Dict:
         """使用预定义的缓存规则"""
         if verb in self.cached_rules and object_class in self.cached_rules[verb]:
@@ -693,6 +733,19 @@ Response:"""
             'requirements': 'General conditions',
             'source': 'default'
         }
+
+    def _load_offline_rules(self) -> Optional[Dict]:
+        """加载离线缓存文件"""
+        if not self.offline_cache_path or not os.path.exists(self.offline_cache_path):
+            return None
+
+        try:
+            with open(self.offline_cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data
+        except Exception as e:
+            print(f"读取离线缓存失败: {e}")
+            return None
     
     def _load_complete_rules(self) -> Dict:
         """加载所有117个动作的完整规则"""
@@ -866,20 +919,27 @@ class ProposalAgent:
         
         # 加载BLIP模型用于图像理解
         try:
-            self.blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            self.blip_model = BlipForConditionalGeneration.from_pretrained(
+            self.blip_caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.blip_caption_model = BlipForConditionalGeneration.from_pretrained(
                 "Salesforce/blip-image-captioning-base"
             ).to(device)
-            self.blip_model.eval()
-            self.use_blip = True
-        except:
-            print("BLIP模型加载失败")
-            self.use_blip = False
-        
-        # 加载CLIP模型用于零样本分类
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.clip_model.eval()
+            self.blip_caption_model.eval()
+            self.use_blip_caption = True
+        except Exception as e:
+            print(f"BLIP描述模型加载失败: {e}")
+            self.use_blip_caption = False
+
+        # 加载CLIP模型用于图文相似度计算
+        try:
+            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            self.clip_model = CLIPModel.from_pretrained(
+                "openai/clip-vit-base-patch32"
+            ).to(device)
+            self.clip_model.eval()
+            self.use_clip_similarity = True
+        except Exception as e:
+            print(f"CLIP模型加载失败: {e}")
+            self.use_clip_similarity = False
     
     def propose(self, image_path: str, detections: Dict) -> List[HOIInstance]:
         """生成HOI提议"""
@@ -888,7 +948,7 @@ class ProposalAgent:
         
         # 使用BLIP生成场景描述
         scene_description = ""
-        if self.use_blip:
+        if self.use_blip_caption:
             scene_description = self._generate_scene_description(image)
         
         # 对每个人-物体对生成交互假设
@@ -900,9 +960,9 @@ class ProposalAgent:
                 # 计算空间关系
                 spatial_relation = self._compute_spatial_relation(human['bbox'], obj['bbox'])
                 
-                # 使用CLIP预测可能的交互
+                # 使用图文相似度模型预测可能的交互
                 possible_verbs = self._predict_interactions_with_clip(
-                    image, human['bbox'], obj['bbox'], 
+                    image, human['bbox'], obj['bbox'],
                     obj.get('class', 'object')
                 )
                 
@@ -928,12 +988,12 @@ class ProposalAgent:
     def _generate_scene_description(self, image):
         """使用BLIP生成场景描述"""
         prompt = "a photo of"
-        inputs = self.blip_processor(image, prompt, return_tensors="pt").to(self.device)
-        
+        inputs = self.blip_caption_processor(image, prompt, return_tensors="pt").to(self.device)
+
         with torch.no_grad():
-            out = self.blip_model.generate(**inputs, max_length=50)
-        
-        description = self.blip_processor.decode(out[0], skip_special_tokens=True)
+            out = self.blip_caption_model.generate(**inputs, max_length=50)
+
+        description = self.blip_caption_processor.decode(out[0], skip_special_tokens=True)
         return description
     
     def _compute_spatial_relation(self, human_bbox, object_bbox):
@@ -968,7 +1028,7 @@ class ProposalAgent:
         }
     
     def _predict_interactions_with_clip(self, image, human_bbox, object_bbox, object_class):
-        """使用CLIP预测可能的交互"""
+        """使用CLIP图文相似度预测可能的交互"""
         # 裁剪交互区域
         x1 = int(max(0, min(human_bbox[0], object_bbox[0])))
         y1 = int(max(0, min(human_bbox[1], object_bbox[1])))
@@ -984,64 +1044,96 @@ class ProposalAgent:
         # 选择相关动词
         relevant_verbs = self._select_relevant_verbs(object_class)
         
+        if not self.use_clip_similarity:
+            return [('hold', 0.3), ('watch', 0.2)]
+
         # 构建文本提示
-        text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:15]]
-        
-        # CLIP推理
+        text_prompts = [f"a person {verb} a {object_class}" for verb in relevant_verbs[:20]]
+
+        # CLIP图文相似度
         try:
             with torch.no_grad():
-                inputs = self.clip_processor(
-                    text=text_prompts,
+                image_inputs = self.clip_processor(
                     images=interaction_region,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True
+                    return_tensors="pt"
                 ).to(self.device)
-                
-                outputs = self.clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1).cpu().numpy()[0]
-            
+                text_inputs = self.clip_processor(
+                    text=text_prompts,
+                    return_tensors="pt",
+                    padding=True
+                ).to(self.device)
+
+                image_features = self.clip_model.get_image_features(**image_inputs)
+                text_features = self.clip_model.get_text_features(**text_inputs)
+
+                image_features = F.normalize(image_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+                cosine_sim = torch.matmul(text_features, image_features.T).squeeze(-1)
+                similarities = torch.clamp((cosine_sim + 1.0) / 2.0, 0.0, 1.0).cpu().numpy()
+
+            # 判断是否存在交互
+            interaction_threshold = 0.5
+            max_similarity = float(similarities.max()) if len(similarities) > 0 else 0.0
+
+            if max_similarity < interaction_threshold:
+                return [('no_interaction', max_similarity)]
+
             # 返回top-k动词
-            top_k = 5
-            top_indices = np.argsort(probs)[-top_k:][::-1]
-            results = [(relevant_verbs[i], float(probs[i])) 
-                      for i in top_indices if i < len(relevant_verbs)]
-            
+            top_k = min(5, len(relevant_verbs))
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            results = [(relevant_verbs[i], float(similarities[i])) for i in top_indices]
+
             return results
-            
+
         except Exception as e:
-            print(f"CLIP推理错误: {e}")
+            print(f"CLIP相似度计算错误: {e}")
             return [('hold', 0.3), ('no_interaction', 0.2)]
     
     def _select_relevant_verbs(self, object_class):
         """根据物体类型选择相关动词"""
         # 基于物体类型选择可能的动词
         verb_groups = {
-            'vehicle': ['ride', 'drive', 'board', 'exit', 'push', 'wash', 'park', 'repair'],
-            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make'],
+            'vehicle': ['ride', 'drive', 'board', 'exit', 'push', 'wash', 'park', 'repair', 'load'],
+            'personal_item': ['carry', 'hold', 'pack', 'wear', 'inspect', 'open'],
+            'food': ['eat', 'cook', 'cut', 'serve', 'smell', 'hold', 'make', 'cut_with', 'buy'],
+            'kitchenware': ['wash', 'hold', 'fill', 'pour', 'dry', 'clean'],
             'furniture': ['sit_on', 'lie_on', 'stand_on', 'move', 'clean', 'push'],
-            'electronic': ['use', 'type_on', 'watch', 'control', 'operate', 'check'],
+            'electronic': ['operate', 'control', 'type_on', 'text_on', 'watch', 'check'],
+            'appliance': ['open', 'operate', 'clean', 'repair', 'install', 'wash'],
+            'bathroom': ['clean', 'flush', 'wash', 'repair', 'inspect'],
             'animal': ['pet', 'feed', 'ride', 'hug', 'walk', 'train', 'groom'],
-            'sports': ['throw', 'catch', 'kick', 'hit', 'play', 'hold', 'swing'],
-            'tool': ['use', 'hold', 'cut_with', 'repair', 'wield', 'work_with']
+            'plant': ['pick', 'cut', 'inspect', 'move'],
+            'sports': ['throw', 'catch', 'kick', 'hit', 'hold', 'swing', 'dribble', 'race'],
+            'tool': ['hold', 'cut_with', 'repair', 'wield', 'assemble', 'make'],
+            'structure': ['paint', 'clean', 'inspect', 'repair', 'stand_on'],
+            'toy': ['hug', 'hold', 'carry', 'pet'],
+            'human': ['hug', 'push', 'pull', 'talk_on', 'teach', 'train', 'watch'],
+            'container': ['hold', 'move', 'clean', 'fill'],
+            'accessory': ['wear', 'hold', 'open', 'pack', 'zip']
         }
-        
-        # 物体类别映射
+
+        # 物体类别映射（覆盖80个COCO物体）
         category_map = {
-            'bicycle': 'vehicle', 'motorcycle': 'vehicle', 'car': 'vehicle',
-            'bus': 'vehicle', 'train': 'vehicle', 'truck': 'vehicle', 'airplane': 'vehicle',
-            'apple': 'food', 'banana': 'food', 'pizza': 'food', 'sandwich': 'food',
-            'cake': 'food', 'donut': 'food', 'hot_dog': 'food',
-            'chair': 'furniture', 'couch': 'furniture', 'bed': 'furniture',
-            'dining_table': 'furniture', 'bench': 'furniture', 'toilet': 'furniture',
-            'tv': 'electronic', 'laptop': 'electronic', 'cell_phone': 'electronic',
-            'keyboard': 'electronic', 'remote': 'electronic', 'mouse': 'electronic',
-            'dog': 'animal', 'cat': 'animal', 'horse': 'animal', 'cow': 'animal',
-            'sheep': 'animal', 'bird': 'animal', 'elephant': 'animal',
-            'sports_ball': 'sports', 'frisbee': 'sports', 'tennis_racket': 'sports',
-            'baseball_bat': 'sports', 'skateboard': 'sports', 'surfboard': 'sports',
-            'knife': 'tool', 'scissors': 'tool', 'fork': 'tool', 'spoon': 'tool'
+            'airplane': 'vehicle', 'apple': 'food', 'backpack': 'personal_item', 'banana': 'food',
+            'baseball_bat': 'sports', 'baseball_glove': 'sports', 'bear': 'animal', 'bed': 'furniture',
+            'bench': 'furniture', 'bicycle': 'vehicle', 'bird': 'animal', 'boat': 'vehicle',
+            'book': 'personal_item', 'bottle': 'kitchenware', 'bowl': 'kitchenware', 'broccoli': 'food',
+            'bus': 'vehicle', 'cake': 'food', 'car': 'vehicle', 'carrot': 'food',
+            'cat': 'animal', 'cell_phone': 'electronic', 'chair': 'furniture', 'clock': 'structure',
+            'couch': 'furniture', 'cow': 'animal', 'cup': 'kitchenware', 'dining_table': 'furniture',
+            'dog': 'animal', 'donut': 'food', 'elephant': 'animal', 'fire_hydrant': 'structure',
+            'fork': 'kitchenware', 'frisbee': 'sports', 'giraffe': 'animal', 'hair_drier': 'appliance',
+            'handbag': 'personal_item', 'horse': 'animal', 'hot_dog': 'food', 'keyboard': 'electronic',
+            'kite': 'sports', 'knife': 'tool', 'laptop': 'electronic', 'microwave': 'appliance',
+            'motorcycle': 'vehicle', 'mouse': 'electronic', 'orange': 'food', 'oven': 'appliance',
+            'parking_meter': 'structure', 'person': 'human', 'pizza': 'food', 'potted_plant': 'plant',
+            'refrigerator': 'appliance', 'remote': 'electronic', 'sandwich': 'food', 'scissors': 'tool',
+            'sheep': 'animal', 'sink': 'bathroom', 'skateboard': 'sports', 'skis': 'sports',
+            'snowboard': 'sports', 'spoon': 'kitchenware', 'sports_ball': 'sports', 'stop_sign': 'structure',
+            'suitcase': 'personal_item', 'surfboard': 'sports', 'teddy_bear': 'toy', 'tennis_racket': 'sports',
+            'tie': 'accessory', 'toaster': 'appliance', 'toilet': 'bathroom', 'toothbrush': 'bathroom',
+            'traffic_light': 'structure', 'train': 'vehicle', 'truck': 'vehicle', 'tv': 'electronic',
+            'umbrella': 'accessory', 'vase': 'container', 'wine_glass': 'kitchenware', 'zebra': 'animal'
         }
         
         # 获取相关动词
@@ -1052,7 +1144,7 @@ class ProposalAgent:
             specific_verbs = []
         
         # 添加通用动词
-        general_verbs = ['hold', 'carry', 'look_at', 'point', 'touch', 'inspect', 'move']
+        general_verbs = ['hold', 'carry', 'point', 'inspect', 'move', 'watch']
         
         # 合并并去重
         all_verbs = list(set(specific_verbs + general_verbs))
